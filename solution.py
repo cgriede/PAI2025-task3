@@ -15,7 +15,7 @@ SAFETY_THRESHOLD = 4  # threshold, upper bound of SA
 # TODO: implement a self-contained solution in the BO_algo class.
 # NOTE: main() is not called by the checker.
 class BO_algo():
-    def __init__(self):
+    def __init__(self, config_number: int = 4):
         """Initializes the algorithm with a parameter configuration."""
 
         self.prior_mean_v = 4.0
@@ -28,7 +28,7 @@ class BO_algo():
 
         self.lambda_pen = 12.0
         #set the kernel hyperparameters
-        kernel_f_params = {
+        self.kernel_f_params = {
             "constant": {
                 "constant_value": 1.0,
                 "constant_value_bounds": (1e-3, 1e3)
@@ -36,14 +36,14 @@ class BO_algo():
             "matern": {
                 "length_scale": 1.0,
                 "nu": 2.5,
-                "length_scale_bounds": (1e-3, 4.0)
+                "length_scale_bounds": (0.1, 20)
             },
             "white": {
-                "noise_level": 0.0001**2,
+                "noise_level": 0.15**2,
                 "noise_level_bounds": "fixed"
             }
         }
-        kernel_v_params = {
+        self.kernel_v_params = {
             "constant": {
                 "constant_value": 1.0,
                 "constant_value_bounds": (1e-2, 100.0)
@@ -51,36 +51,43 @@ class BO_algo():
             "matern": {
                 "length_scale": 1.0,
                 "nu": 2.5,
-                "length_scale_bounds": (1e-3, 4.0)
+                "length_scale_bounds": (0.1, 20)
             },
             "white": {
-                "noise_level": 0.0001**2,
+                "noise_level": 1e-8,
                 "noise_level_bounds": "fixed"
             }
         }
+        self._hyperparam_config(config_number=config_number)
 
         #kernel for objective f (logP) match sigma_f: 0.15
-        kernel_f = ConstantKernel(**kernel_f_params["constant"])\
-            * Matern(**kernel_f_params["matern"]) \
-            + WhiteKernel(**kernel_f_params["white"])
+        self.kernel_f = ConstantKernel(**self.kernel_f_params["constant"])\
+            * Matern(**self.kernel_f_params["matern"]) \
+            + WhiteKernel(**self.kernel_f_params["white"])
         #kernel for constraint v (SA) match sigma_v: 0.0001
-        kernel_v = ConstantKernel(**kernel_v_params["constant"]) \
-         * Matern(**kernel_v_params["matern"]) \
-         + WhiteKernel(**kernel_v_params["white"])
+        self.kernel_v = ConstantKernel(**self.kernel_v_params["constant"]) \
+         * Matern(**self.kernel_v_params["matern"]) \
+         + WhiteKernel(**self.kernel_v_params["white"])
+
+        if getattr(self, "use_additive_kernel_v", False):
+            self.kernel_v = (
+                ConstantKernel(1.0, (1e-3, 1e3)) * DotProduct(sigma_0=1.0, sigma_0_bounds=(1e-5, 20.0)) +
+                ConstantKernel(2.0, (1e-3, 1e3)) * RBF(length_scale=3.0, length_scale_bounds=(0.5, 20.0)) +
+                WhiteKernel(**self.kernel_v_params["white"])
+            )
 
         self.gp_f = GaussianProcessRegressor(
-         kernel               = kernel_f,
+         kernel               = self.kernel_f,
          alpha                = 0.0,
-         n_restarts_optimizer = 10,
+         n_restarts_optimizer = 15,
          normalize_y          = True,
          )
         self.gp_v = GaussianProcessRegressor(
-         kernel               = kernel_v,
+         kernel               = self.kernel_v,
          alpha                = 0.0,
-         n_restarts_optimizer = 10,
+         n_restarts_optimizer = 15,
          normalize_y          = False,
          )
-
 
         self.X = []
         self.Y_f = []
@@ -91,6 +98,38 @@ class BO_algo():
         self.best_safe_f = -np.inf
 
         self._mean_set = False
+
+    def _hyperparam_config(self, config_number: int):
+        """
+        Configure the hyperparameters for the Gaussian processes.
+        """
+        if config_number == 1:
+            self.lambda_pen = 100.0
+            self.kernel_f_params["matern"]["length_scale"] = 1.0
+            self.kernel_v_params["matern"]["length_scale"] = 5.0
+            self.beta_constant = 5.0      # more optimistic on f to still explore safely
+            self.beta_log = 1.0
+
+        elif config_number == 2:
+            self.lambda_pen = 12.0
+            self.kernel_f_params["matern"]["length_scale"] = 0.5
+            self.kernel_v_params["matern"]["length_scale"] = 10.0
+            self.beta_constant = 2.0
+            self.beta_log = 0.5
+
+        elif config_number == 3:
+            self.lambda_pen = 20.0
+            self.kernel_f_params["matern"]["length_scale"] = 3.0
+            self.kernel_v_params["matern"]["length_scale"] = 10.0
+            self.beta_constant = 3.0
+            self.beta_log = 1.5
+
+        elif config_number == 4:
+            self.use_additive_kernel_v = True
+            self.lambda_pen = 15.0
+            self.kernel_f_params["matern"]["length_scale"] = 1.0
+            self.beta_constant = 3.0
+            self.beta_log = 0.8
 
     def next_recommendation(self):
         """
