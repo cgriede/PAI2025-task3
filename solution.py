@@ -3,7 +3,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import fmin_l_bfgs_b
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, ConstantKernel, Matern, WhiteKernel
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel, Matern, WhiteKernel, DotProduct
+from scipy.stats import norm  # Add this import for P(safe)
+
 
 # global variables
 DOMAIN = np.array([[0, 10]])  # restrict \theta in [0, 10]
@@ -15,17 +17,70 @@ SAFETY_THRESHOLD = 4  # threshold, upper bound of SA
 class BO_algo():
     def __init__(self):
         """Initializes the algorithm with a parameter configuration."""
-        # TODO: Define all relevant class members for your BO algorithm here.
-        
-        #kernel for objective f (logP)
-        kernel_f = ConstantKernel(1.0, (1e-3, 1e3)) * Matern(length_scale=1.0, nu=2.5) \
-                    + WhiteKernel(noise_level=0.15**2, noise_level_bounds=(1e-10, 1e-1))
-        #kernel for constraint v (SA)
-        kernel_v = ConstantKernel(1.0, (1e-2, 100.0)) * Matern(length_scale=1.0, length_scale_bounds=(0.05, 5.0), nu=2.5) \
-                + WhiteKernel(noise_level=0.1, noise_level_bounds=(1e-3, 0.5))
 
-        self.gp_f = GaussianProcessRegressor(kernel=kernel_f, alpha=0.0, n_restarts_optimizer=10, normalize_y=True)
-        self.gp_v = GaussianProcessRegressor(kernel=kernel_v, alpha=0.0, n_restarts_optimizer=10, normalize_y=True)
+        self.prior_mean_v = 4.0
+
+        self.beta_constant = 3.0
+        self.beta_log = 0.5
+
+        self.expander_constant = 30.0
+        self.expander_log = 5.0
+
+        self.lambda_pen = 12.0
+        #set the kernel hyperparameters
+        kernel_f_params = {
+            "constant": {
+                "constant_value": 1.0,
+                "constant_value_bounds": (1e-3, 1e3)
+            },
+            "matern": {
+                "length_scale": 1.0,
+                "nu": 2.5,
+                "length_scale_bounds": (1e-3, 4.0)
+            },
+            "white": {
+                "noise_level": 0.0001**2,
+                "noise_level_bounds": "fixed"
+            }
+        }
+        kernel_v_params = {
+            "constant": {
+                "constant_value": 1.0,
+                "constant_value_bounds": (1e-2, 100.0)
+            },
+            "matern": {
+                "length_scale": 1.0,
+                "nu": 2.5,
+                "length_scale_bounds": (1e-3, 4.0)
+            },
+            "white": {
+                "noise_level": 0.0001**2,
+                "noise_level_bounds": "fixed"
+            }
+        }
+
+        #kernel for objective f (logP) match sigma_f: 0.15
+        kernel_f = ConstantKernel(**kernel_f_params["constant"])\
+            * Matern(**kernel_f_params["matern"]) \
+            + WhiteKernel(**kernel_f_params["white"])
+        #kernel for constraint v (SA) match sigma_v: 0.0001
+        kernel_v = ConstantKernel(**kernel_v_params["constant"]) \
+         * Matern(**kernel_v_params["matern"]) \
+         + WhiteKernel(**kernel_v_params["white"])
+
+        self.gp_f = GaussianProcessRegressor(
+         kernel               = kernel_f,
+         alpha                = 0.0,
+         n_restarts_optimizer = 10,
+         normalize_y          = True,
+         )
+        self.gp_v = GaussianProcessRegressor(
+         kernel               = kernel_v,
+         alpha                = 0.0,
+         n_restarts_optimizer = 10,
+         normalize_y          = False,
+         )
+
 
         self.X = []
         self.Y_f = []
@@ -34,6 +89,8 @@ class BO_algo():
         #track best safe point
         self.best_safe_x = None
         self.best_safe_f = -np.inf
+
+        self._mean_set = False
 
     def next_recommendation(self):
         """
@@ -83,6 +140,7 @@ class BO_algo():
 
         return x_opt
 
+
     def acquisition_function(self, x: np.ndarray):
         x = np.atleast_2d(x)
 
@@ -92,25 +150,34 @@ class BO_algo():
         sigma_f = sigma_f.reshape(-1, 1)
         sigma_v = sigma_v.reshape(-1, 1)
 
-        # Very safe beta — starts high, grows slowly
         n = max(len(self.X), 1)
-        beta = 2.5 + 0.8 * np.log(n + 1)
+        beta = self.beta_constant + self.beta_log * np.log(n + 1)
 
+        
         U_f = mu_f + beta * sigma_f
         L_v = mu_v - beta * sigma_v
+        U_v = mu_v + beta * sigma_v
 
         safe = (L_v < SAFETY_THRESHOLD).ravel()
 
+        # Lagrangian penalty term: λ * max(v - κ, 0)
+
+        penalty = self.lambda_pen * np.maximum(U_v - SAFETY_THRESHOLD, 0).ravel()  # Penalize if upper v > κ (risky)
+
         current_max = self.best_safe_f if self.best_safe_f > -np.inf else mu_f.max()
 
-        # Maximizers: improve objective
         maximizer = np.maximum(U_f.ravel() - current_max, 0) * safe
 
-        # Expanders: grow safe set — THIS IS THE KEY LINE
         expander = sigma_v.ravel() * safe
-        expander *= 8.0 + 2.0 * np.log(n + 1)   # grows over time → safe set expands fast
+        expander *= self.expander_constant + self.expander_log * np.log(n + 1)
 
-        af = maximizer + expander
+        # Apply Lagrangian: penalize the entire AF for risky points
+        af = (maximizer + expander) - penalty * safe  # Only penalize possibly safe points
+
+        # Soft P(safe) multiplier for extra safety (from Gelbart paper)
+        p_safe = norm.cdf((SAFETY_THRESHOLD - mu_v.ravel()) / sigma_v.ravel())
+        af *= p_safe  # Downweight points with low P(v < κ)
+
         return af
 
     def add_data_point(self, x: float, f: float, v: float):
@@ -136,6 +203,14 @@ class BO_algo():
         # Fit both GPs
         self.gp_f.fit(X_arr, self.Y_f)
         self.gp_v.fit(X_arr, self.Y_v)
+
+        # CRITICAL: Set prior mean = 4.0 ONLY ONCE
+        if not self._mean_set and len(self.X) == 1:  # after first point
+            self.gp_v.kernel_.k1.constant_value = self.prior_mean_v
+            self.gp_v.kernel_.k1.constant_value_bounds = "fixed"
+            # Refit once with correct mean
+            self.gp_v.fit(X_arr, self.Y_v)
+            self._mean_set = True
 
         # Update best known safe point
         if v < SAFETY_THRESHOLD and f > self.best_safe_f:
@@ -331,8 +406,10 @@ def main():
     # Compute regret
     regret = (0 - f(solution))
 
+    unsafe_evals = len([v for v in agent.Y_v if v > SAFETY_THRESHOLD])
+
     print(f'Optimal value: 0\nProposed solution {solution}\nSolution value '
-          f'{f(solution)}\nRegret {regret}\nUnsafe-evals TODO\n')
+          f'{f(solution)}\nRegret {regret}\nUnsafe-evals {unsafe_evals}\n')
 
 
 if __name__ == "__main__":
